@@ -16,3 +16,5 @@ curl -fsSL https://raw.githubusercontent.com/juanlusoft/hermes-unattended-instal
 ```
 
 The installer will print the authorization link or code if Hermes emits one, then keep the terminal interactive so you can finish login.
+
+Full details: [HERMES_OAUTH.md](./HERMES_OAUTH.md)
