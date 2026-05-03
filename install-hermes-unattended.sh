@@ -8,6 +8,10 @@ HERMES_INSTALL_CMD_FALLBACK="curl -fsSL https://raw.githubusercontent.com/NousRe
 
 HERMES_INSTALL_CMD=""
 HERMES_DOCS_URL="$HERMES_DOCS_URL_DEFAULT"
+HERMES_AUTH_PROVIDER=""
+HERMES_AUTH_TYPE="oauth"
+HERMES_AUTH_NO_BROWSER="1"
+SKIP_HERMES_AUTH="0"
 
 log() { printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 warn() { printf "\n[WARN] %s\n" "$*" >&2; }
@@ -53,6 +57,25 @@ parse_args() {
         [[ $# -gt 0 ]] || die "Missing value for --firecrawl-api-key"
         FIRECRAWL_API_KEY="$1"
         ;;
+      --hermes-auth-provider)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --hermes-auth-provider"
+        HERMES_AUTH_PROVIDER="$1"
+        ;;
+      --hermes-auth-type)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --hermes-auth-type"
+        HERMES_AUTH_TYPE="$1"
+        ;;
+      --hermes-auth-browser)
+        HERMES_AUTH_NO_BROWSER="0"
+        ;;
+      --hermes-auth-no-browser)
+        HERMES_AUTH_NO_BROWSER="1"
+        ;;
+      --skip-hermes-auth)
+        SKIP_HERMES_AUTH="1"
+        ;;
       -h|--help)
         cat <<EOF
 Usage: $0 [options]
@@ -66,6 +89,11 @@ Options:
   --telegram-user-id "<id>"     Optional; avoids prompt
   --chat-id "<id>"              Alias of --telegram-user-id
   --firecrawl-api-key "<key>"   Optional; avoids prompt
+  --hermes-auth-provider "<id>"  Optional; enables Hermes OAuth setup
+  --hermes-auth-type "<type>"    Default: oauth
+  --hermes-auth-browser         Try opening browser instead of device-code only
+  --hermes-auth-no-browser      Force no-browser device-code flow
+  --skip-hermes-auth            Skip Hermes auth setup entirely
 EOF
         exit 0
         ;;
@@ -183,6 +211,127 @@ ensure_ollama_model() {
   ollama pull "$model"
 }
 
+setup_hermes_auth() {
+  local provider="$1"
+  local auth_type="$2"
+  local no_browser="$3"
+
+  if [[ -z "$provider" ]]; then
+    return 0
+  fi
+
+  if ! need_cmd hermes; then
+    die "Hermes is not installed yet; cannot configure auth for $provider"
+  fi
+
+  log "Configuring Hermes auth for provider: $provider"
+  if hermes auth status "$provider" >/dev/null 2>&1; then
+    log "Hermes auth already present for $provider"
+    return 0
+  fi
+
+  local -a cmd=(hermes auth add "$provider" --type "$auth_type")
+  if [[ "$no_browser" == "1" ]]; then
+    cmd+=(--no-browser)
+  fi
+
+  cat <<EOF
+
+Hermes will now start the OAuth flow for:
+  provider: $provider
+  type: $auth_type
+
+If a browser link appears, open it on any machine and complete the login.
+If a code is requested, paste it back into this terminal.
+EOF
+
+  python3 - "${cmd[@]}" <<'PY'
+import os
+import pty
+import re
+import select
+import subprocess
+import sys
+
+cmd = sys.argv[1:]
+master_fd, slave_fd = pty.openpty()
+proc = subprocess.Popen(
+    cmd,
+    stdin=slave_fd,
+    stdout=slave_fd,
+    stderr=slave_fd,
+    close_fds=True,
+    env=os.environ.copy(),
+)
+os.close(slave_fd)
+
+url_seen = None
+code_seen = None
+watch_stdin = sys.stdin.isatty()
+
+def forward_stdin():
+    try:
+        data = os.read(sys.stdin.fileno(), 1024)
+    except OSError:
+        return False
+    if not data:
+        return False
+    os.write(master_fd, data)
+    return True
+
+def extract_hints(text):
+    global url_seen, code_seen
+    if url_seen is None:
+        m = re.search(r'https?://[^\s<>"\']+', text)
+        if m:
+            url_seen = m.group(0).rstrip(').,;')
+            sys.stdout.write("\n[Hermes] Browser link detected:\n")
+            sys.stdout.write(url_seen + "\n")
+            sys.stdout.flush()
+    if code_seen is None:
+        m = re.search(r'(?i)(?:user\s*code|verification\s*code|device\s*code|code)[:\s]+([A-Z0-9-]{4,})', text)
+        if m:
+            code_seen = m.group(1)
+            sys.stdout.write("\n[Hermes] Code detected:\n")
+            sys.stdout.write(code_seen + "\n")
+            sys.stdout.flush()
+
+try:
+    while True:
+        readables = [master_fd]
+        if watch_stdin:
+            readables.append(sys.stdin)
+        rlist, _, _ = select.select(readables, [], [])
+        if master_fd in rlist:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            text = data.decode(errors="replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            extract_hints(text)
+        if sys.stdin in rlist:
+            if not forward_stdin():
+                watch_stdin = False
+        if proc.poll() is not None and not watch_stdin:
+            break
+    rc = proc.wait()
+finally:
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+
+raise SystemExit(rc)
+PY
+
+  log "Hermes auth flow finished for $provider"
+  hermes auth status "$provider" || warn "Could not confirm Hermes auth status for $provider"
+}
+
 prompt_if_empty() {
   local var_name="$1"
   local prompt="$2"
@@ -217,6 +366,10 @@ main() {
   ensure_pipx "$pm"
   ensure_ollama
   ensure_hermes
+
+  if [[ "$SKIP_HERMES_AUTH" != "1" ]]; then
+    setup_hermes_auth "$HERMES_AUTH_PROVIDER" "$HERMES_AUTH_TYPE" "$HERMES_AUTH_NO_BROWSER"
+  fi
 
   OLLAMA_MODEL="${OLLAMA_MODEL:-$MODEL_DEFAULT}"
   OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-$OLLAMA_BASE_URL_DEFAULT}"
